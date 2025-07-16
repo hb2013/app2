@@ -1,0 +1,597 @@
+name: Release
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  release:
+    permissions:
+      contents: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS ARM (Apple Silicon)
+          - platform: macos-latest
+            arch: aarch64
+          # macOS Intel
+          - platform: macos-latest
+            arch: x86_64
+          # Windows
+          - platform: windows-latest
+          # Android 单架构构建
+          - platform: ubuntu-latest
+            target: android
+            android_arch: aarch64-linux-android
+            arch_name: arm64-v8a
+          # - platform: ubuntu-latest
+          #   target: android
+          #   android_arch: armv7-linux-androideabi
+          #   arch_name: armeabi-v7a
+          # - platform: ubuntu-latest
+          #   target: android
+          #   android_arch: x86_64-linux-android
+          #   arch_name: x86_64
+          # - platform: ubuntu-latest
+          #   target: android
+          #   android_arch: i686-linux-android
+          #   arch_name: x86
+          # Android 通用APK (所有架构)
+          # - platform: ubuntu-latest
+          #   target: android
+          #   universal: true
+          #   arch_name: universal
+        # Uncomment to enable Ubuntu build
+        # - platform: ubuntu-20.04
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (ubuntu only)
+        if: matrix.platform == 'ubuntu-20.04'
+        # You can remove libayatana-appindicator3-dev if you don't use the system tray feature.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev libayatana-appindicator3-dev librsvg2-dev
+          
+      - name: Install Android dependencies
+        if: matrix.target == 'android'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-11-jdk
+          
+          # 使用 GitHub Actions 预装的 Android SDK
+          echo "使用 GitHub Actions 预装的 Android SDK"
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          
+          # 确保环境变量一致，避免冲突
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
+          
+          # 验证 SDK 目录
+          ls -la $ANDROID_HOME || echo "Android SDK directory not found"
+          
+          # 确保 NDK 目录存在
+          mkdir -p $ANDROID_HOME/ndk
+          
+      - name: Setup Android SDK
+        if: matrix.target == 'android'
+        run: |
+          # 使用 GitHub Actions 预装的 Android SDK 工具
+          export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin
+          export PATH=$PATH:$ANDROID_HOME/platform-tools
+          
+          # 接受许可
+          yes | sdkmanager --licenses || true
+          
+          # 安装 SDK 组件和 NDK
+          sdkmanager --verbose "platform-tools" "platforms;android-33" "build-tools;33.0.0" "ndk;25.2.9519653"
+          
+          # 验证 NDK 安装
+          ls -la $ANDROID_HOME/ndk/25.2.9519653 || echo "NDK not installed correctly"
+          
+          # 设置环境变量
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/25.2.9519653" >> $GITHUB_ENV
+          echo "NDK_HOME=$ANDROID_HOME/ndk/25.2.9519653" >> $GITHUB_ENV
+          echo "PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools" >> $GITHUB_ENV
+
+      - name: Rust setup
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch != '' && format('{0}-apple-darwin', matrix.arch) || (matrix.target == 'android' && 'aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android') || '' }}
+          
+      - name: Install cargo-tauri
+        if: matrix.target == 'android'
+        run: |
+          # 安装稳定版本
+          cargo install tauri-cli --version "^2.0.0" --locked --force
+          
+          # 验证安装
+          cargo tauri --version
+          
+          # 检查 tauri 命令是否支持 android 子命令
+          cargo tauri help android
+
+      # 为所有平台安装Tauri CLI
+      - name: Install Tauri CLI for all platforms
+        if: matrix.target != 'android'
+        run: |
+          cargo install tauri-cli --version "^2.0.0" --locked --force
+          cargo tauri --version
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Sync node version and setup cache
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'yarn' # Set this to npm, yarn or pnpm.
+
+      - name: Install frontend dependencies
+        # If you don't have `beforeBuildCommand` configured you may want to build your frontend here too.
+        run: yarn install # Change this to npm, yarn or pnpm.
+
+      - name: Prepare Android build environment
+        if: matrix.target == 'android'
+        run: |
+          # 验证 SDK 和 NDK 环境
+          echo "检查环境变量:"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          echo "NDK_HOME=$NDK_HOME"
+          
+          # 确保目录存在
+          mkdir -p src-tauri/gen/android
+          
+          # 为Android创建特定的配置 - 使用与Tauri 2.0兼容的格式
+          cat > src-tauri/tauri.android.conf.json << 'EOL'
+          {
+            "$schema": "https://schema.tauri.app/config/2",
+            "bundle": {
+              "active": true,
+              "targets": "all",
+              "android": {
+                "minSdkVersion": 24
+              }
+            }
+          }
+          EOL
+          
+          # 确认配置文件已创建
+          ls -la src-tauri/tauri.android.conf.json || echo "Android配置文件未创建成功"
+          echo "Android配置文件内容:"
+          cat src-tauri/tauri.android.conf.json
+          
+          # 检查原始配置文件
+          echo "原始配置文件内容:"
+          cat src-tauri/tauri.conf.json
+          
+          # 创建Android签名密钥库
+          echo "创建Android签名密钥库..."
+          mkdir -p ~/.android
+          
+          # 创建一个默认的调试密钥库
+          echo "创建默认调试密钥库"
+          keytool -genkey -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" || echo "密钥库可能已存在"
+          
+          # 确认密钥库已创建
+          ls -la ~/.android/debug.keystore || echo "密钥库未创建成功"
+          
+      - name: Build Android app
+        if: matrix.target == 'android'
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+          NDK_HOME: ${{ env.NDK_HOME }}
+          # 设置明确的签名环境变量
+          ANDROID_KEYSTORE_PATH: $HOME/.android/debug.keystore
+          ANDROID_KEYSTORE_PASSWORD: android
+          ANDROID_KEY_ALIAS: androiddebugkey
+          ANDROID_KEY_PASSWORD: android
+        run: |
+          echo "Android SDK path: $ANDROID_HOME"
+          echo "Android SDK ROOT: $ANDROID_SDK_ROOT"
+          echo "Android NDK path: $ANDROID_NDK_HOME"
+          echo "NDK HOME: $NDK_HOME"
+          
+          # 验证签名环境变量
+          echo "签名环境变量:"
+          echo "ANDROID_KEYSTORE_PATH=$ANDROID_KEYSTORE_PATH"
+          echo "ANDROID_KEY_ALIAS=$ANDROID_KEY_ALIAS"
+          
+          # 验证密钥库存在
+          ls -la $ANDROID_KEYSTORE_PATH || echo "密钥库不存在"
+          
+          # 验证 SDK 和 NDK 目录
+          ls -la $ANDROID_HOME/cmdline-tools/latest/bin/ || echo "cmdline-tools not found"
+          ls -la $ANDROID_HOME/ndk || echo "NDK directory not found"
+          ls -la $NDK_HOME || echo "NDK_HOME directory not found"
+          
+          # 删除旧的 gen/android 目录
+          echo "删除旧的 gen/android 目录..."
+          rm -rf src-tauri/gen/android
+          
+          # 使用明确的环境变量运行 tauri 命令
+          echo "初始化 Android 项目..."
+          # 使用绝对路径
+          CONF_PATH=$(realpath src-tauri/tauri.android.conf.json)
+          echo "使用配置文件路径: $CONF_PATH"
+          cargo tauri android init --verbose --ci --config $CONF_PATH
+          
+          # 确认 gen/android 目录是否创建
+          ls -la src-tauri/gen || echo "gen directory not found"
+          
+          # 创建签名配置文件
+          echo "创建签名配置文件..."
+          mkdir -p src-tauri/gen/android
+          cat > src-tauri/gen/android/signing.gradle << 'EOL'
+          android {
+              signingConfigs {
+                  release {
+                      storeFile file(System.getenv('ANDROID_KEYSTORE_PATH'))
+                      storePassword System.getenv('ANDROID_KEYSTORE_PASSWORD')
+                      keyAlias System.getenv('ANDROID_KEY_ALIAS')
+                      keyPassword System.getenv('ANDROID_KEY_PASSWORD')
+                  }
+                  debug {
+                      storeFile file(System.getenv('ANDROID_KEYSTORE_PATH'))
+                      storePassword System.getenv('ANDROID_KEYSTORE_PASSWORD')
+                      keyAlias System.getenv('ANDROID_KEY_ALIAS')
+                      keyPassword System.getenv('ANDROID_KEY_PASSWORD')
+                  }
+              }
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.release
+                  }
+                  debug {
+                      signingConfig signingConfigs.debug
+                  }
+              }
+          }
+          EOL
+          
+          # 确认签名配置文件已创建
+          ls -la src-tauri/gen/android/signing.gradle || echo "签名配置文件未创建成功"
+          echo "签名配置文件内容:"
+          cat src-tauri/gen/android/signing.gradle
+          
+          # 确保Gradle能找到签名配置
+          echo "添加签名配置到Gradle构建..."
+          if [ -f "src-tauri/gen/android/app/build.gradle" ]; then
+            # 检查是否已包含signing.gradle
+            if ! grep -q "apply from: '../signing.gradle'" "src-tauri/gen/android/app/build.gradle"; then
+              # 在android闭包前添加引用
+              sed -i -e '/android {/i apply from: "../signing.gradle"' src-tauri/gen/android/app/build.gradle
+              echo "已添加signing.gradle引用到build.gradle"
+            else
+              echo "build.gradle已包含signing.gradle引用"
+            fi
+            
+            # 显示修改后的build.gradle
+            echo "修改后的build.gradle内容:"
+            cat src-tauri/gen/android/app/build.gradle
+          else
+            echo "app/build.gradle不存在，可能需要先运行init命令"
+          fi
+          
+          # 构建 Android 应用
+          echo "构建 Android 应用..."
+          
+          if [ "${{ matrix.universal }}" = "true" ]; then
+            # 构建通用APK (包含所有架构)
+            echo "构建通用APK (包含所有架构)..."
+            cargo tauri android build --verbose --apk --ci --config $CONF_PATH
+          else
+            # 构建单架构APK
+            ARCH_NAME="aarch64"
+            if [ "${{ matrix.android_arch }}" = "armv7-linux-androideabi" ]; then
+              ARCH_NAME="armv7"
+            elif [ "${{ matrix.android_arch }}" = "i686-linux-android" ]; then
+              ARCH_NAME="i686"
+            elif [ "${{ matrix.android_arch }}" = "x86_64-linux-android" ]; then
+              ARCH_NAME="x86_64"
+            fi
+            echo "使用架构名称: $ARCH_NAME 构建单架构APK"
+            cargo tauri android build --verbose --apk --ci --target $ARCH_NAME --config $CONF_PATH
+          fi
+          
+          # 显示构建的APK信息
+          echo "构建的APK文件:"
+          find src-tauri/gen/android -name "*.apk" -type f -exec ls -la {} \;
+          
+          # 验证APK签名
+          echo "验证APK签名:"
+          find src-tauri/gen/android -name "*.apk" -type f -exec $ANDROID_HOME/build-tools/33.0.0/apksigner verify --verbose {} \; || echo "APK签名验证失败"
+          
+          mkdir -p target/release/bundle/android
+          find src-tauri/gen/android -name "*.apk" -type f -exec cp {} target/release/bundle/android/ \;
+          
+          # 重命名APK文件以包含架构信息
+          if [ -d "target/release/bundle/android" ]; then
+            cd target/release/bundle/android
+            for f in *.apk; do
+              if [ -f "$f" ]; then
+                mv "$f" "$(basename "$f" .apk)-${{ matrix.arch_name }}.apk"
+              fi
+            done
+            cd -
+          fi
+          
+      - name: Build the app (non-Android)
+        if: matrix.target != 'android' && matrix.platform != 'windows-latest'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "构建桌面应用..."
+          yarn build
+          
+          # 根据平台设置构建参数
+          if [[ "${{ matrix.platform }}" == "macos-latest" || "${{ matrix.platform }}" == "ubuntu-latest" ]]; then
+            # macOS/Linux 构建
+            if [[ "${{ matrix.arch }}" != "" ]]; then
+              echo "使用基础配置构建macOS (避免使用高级压缩选项)..."
+              cargo tauri build --verbose --target ${{ matrix.arch }}-apple-darwin
+            else
+              cargo tauri build --verbose
+            fi
+            
+            # 添加调试信息，查找构建产物
+            echo "查找构建产物..."
+            # 确保target目录存在
+            if [ -d "src-tauri/target" ]; then
+              echo "src-tauri/target目录内容:"
+              find src-tauri/target -type f -name "*.dmg" -o -name "*.app" -o -name "*.deb" -o -name "*.AppImage"
+              
+              # 查找特定架构目录
+              if [[ "${{ matrix.arch }}" != "" ]]; then
+                echo "查找特定架构目录: ${{ matrix.arch }}-apple-darwin"
+                
+                # 使用确切的路径
+                EXACT_DMG_PATH="src-tauri/target/${{ matrix.arch }}-apple-darwin/release/bundle/dmg"
+                EXACT_APP_PATH="src-tauri/target/${{ matrix.arch }}-apple-darwin/release/bundle/macos"
+                
+                echo "检查确切的DMG路径: $EXACT_DMG_PATH"
+                ls -la $EXACT_DMG_PATH || echo "DMG目录不存在"
+                
+                echo "检查确切的APP路径: $EXACT_APP_PATH"
+                ls -la $EXACT_APP_PATH || echo "APP目录不存在"
+              fi
+            else
+              echo "src-tauri/target目录不存在，可能构建失败"
+              ls -la
+              ls -la src-tauri || echo "src-tauri目录不存在"
+            fi
+            
+            # 确保目录存在
+            mkdir -p target/release/bundle/dmg
+            mkdir -p target/release/bundle/macos
+            mkdir -p target/release/bundle/deb
+            mkdir -p target/release/bundle/appimage
+            
+            # 复制构建产物到标准位置
+            if [ -d "src-tauri/target" ]; then
+              # 如果有特定架构，使用确切的路径
+              if [[ "${{ matrix.arch }}" != "" ]]; then
+                echo "从确切路径复制文件"
+                
+                # 使用确切的路径
+                EXACT_DMG_PATH="src-tauri/target/${{ matrix.arch }}-apple-darwin/release/bundle/dmg"
+                EXACT_APP_PATH="src-tauri/target/${{ matrix.arch }}-apple-darwin/release/bundle/macos"
+                
+                # 复制DMG文件
+                if [ -d "$EXACT_DMG_PATH" ]; then
+                  cp -v $EXACT_DMG_PATH/*.dmg target/release/bundle/dmg/ || echo "复制DMG文件失败"
+                else
+                  echo "DMG目录不存在: $EXACT_DMG_PATH"
+                fi
+                
+                # 复制APP文件
+                if [ -d "$EXACT_APP_PATH" ]; then
+                  cp -rv $EXACT_APP_PATH/*.app target/release/bundle/macos/ || echo "复制APP文件失败"
+                else
+                  echo "APP目录不存在: $EXACT_APP_PATH"
+                fi
+              else
+                # 复制dmg文件
+                find src-tauri/target -name "*.dmg" -exec cp {} target/release/bundle/dmg/ \; || echo "没有找到dmg文件"
+                # 复制app文件
+                find src-tauri/target -name "*.app" -type d -exec cp -r {} target/release/bundle/macos/ \; || echo "没有找到app文件"
+              fi
+              
+              # 复制deb文件
+              find src-tauri/target -name "*.deb" -exec cp {} target/release/bundle/deb/ \; || echo "没有找到deb文件"
+              # 复制AppImage文件
+              find src-tauri/target -name "*.AppImage" -exec cp {} target/release/bundle/appimage/ \; || echo "没有找到AppImage文件"
+              
+              # 显示复制后的文件
+              echo "复制后的文件:"
+              ls -la target/release/bundle/dmg || echo "dmg目录为空"
+              ls -la target/release/bundle/macos || echo "macos目录为空"
+            fi
+          fi
+          
+      - name: Build the app (Windows)
+        if: matrix.platform == 'windows-latest'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          echo "构建Windows桌面应用..."
+          yarn build
+          
+          # 使用与原始配置文件完全相同的结构，只保留必要的部分
+          $originalConfig = Get-Content "src-tauri\tauri.conf.json" | ConvertFrom-Json
+          $windowsConfig = [PSCustomObject]@{
+            '$schema' = "https://schema.tauri.app/config/2"
+            productName = $originalConfig.productName
+            version = $originalConfig.version
+            identifier = $originalConfig.identifier
+            build = $originalConfig.build
+            app = $originalConfig.app
+            bundle = @{
+              active = $true
+              targets = "all"
+              icon = $originalConfig.bundle.icon
+            }
+          }
+          
+          # 将配置转换为JSON并保存
+          $windowsConfigJson = $windowsConfig | ConvertTo-Json -Depth 10
+          $windowsConfigJson | Out-File -FilePath "src-tauri\tauri.windows.conf.json" -Encoding utf8
+          
+          # 确认配置文件已创建并显示内容
+          if (Test-Path "src-tauri\tauri.windows.conf.json") {
+            echo "Windows配置文件创建成功"
+            echo "配置文件内容:"
+            Get-Content "src-tauri\tauri.windows.conf.json"
+          } else {
+            echo "Windows配置文件未创建成功"
+            exit 1
+          }
+          
+          # 使用绝对路径构建
+          $configPath = Resolve-Path "src-tauri\tauri.windows.conf.json"
+          echo "使用配置文件路径: $configPath"
+          cargo tauri build --verbose --config $configPath
+          
+          # 添加调试信息，查找构建产物
+          echo "查找构建产物..."
+          
+          # 使用确切的路径
+          $exactMsiPath = "src-tauri\target\release\bundle\msi"
+          $exactExePath = "src-tauri\target\release\bundle\nsis"
+          $mainExePath = "src-tauri\target\release\tauri-app.exe"
+          
+          # 检查确切的MSI路径
+          echo "检查确切的MSI路径: $exactMsiPath"
+          if (Test-Path $exactMsiPath) {
+            Get-ChildItem -Path $exactMsiPath | ForEach-Object { $_.FullName }
+          } else {
+            echo "MSI目录不存在"
+          }
+          
+          # 检查确切的EXE路径
+          echo "检查确切的EXE路径: $exactExePath"
+          if (Test-Path $exactExePath) {
+            Get-ChildItem -Path $exactExePath | ForEach-Object { $_.FullName }
+          } else {
+            echo "EXE目录不存在"
+          }
+          
+          # 检查主应用程序EXE
+          echo "检查主应用程序EXE: $mainExePath"
+          if (Test-Path $mainExePath) {
+            echo "主应用程序EXE存在: $mainExePath"
+          } else {
+            echo "主应用程序EXE不存在，尝试查找其他可能的位置"
+            Get-ChildItem -Path "src-tauri\target\release\*.exe" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }
+          }
+          
+          # 确保目录存在
+          New-Item -Path target\release\bundle\msi -ItemType Directory -Force
+          New-Item -Path target\release\bundle\nsis -ItemType Directory -Force
+          New-Item -Path target\release\bundle\app -ItemType Directory -Force
+          
+          # 复制构建产物到标准位置
+          if (Test-Path $exactMsiPath) {
+            # 复制MSI文件
+            Copy-Item -Path "$exactMsiPath\*.msi" -Destination target\release\bundle\msi\ -Verbose -ErrorAction SilentlyContinue
+            if (-not $?) { echo "没有找到msi文件或复制失败" }
+          } else {
+            echo "MSI源目录不存在: $exactMsiPath"
+          }
+          
+          if (Test-Path $exactExePath) {
+            # 复制EXE文件
+            Copy-Item -Path "$exactExePath\*setup.exe" -Destination target\release\bundle\nsis\ -Verbose -ErrorAction SilentlyContinue
+            if (-not $?) { echo "没有找到exe文件或复制失败" }
+          } else {
+            echo "EXE源目录不存在: $exactExePath"
+          }
+          
+          # 复制主应用程序EXE
+          if (Test-Path $mainExePath) {
+            Copy-Item -Path $mainExePath -Destination target\release\bundle\app\ -Verbose
+            echo "已复制主应用程序EXE到: target\release\bundle\app\"
+          } else {
+            echo "主应用程序EXE不存在，无法复制"
+          }
+          
+          # 显示复制后的文件
+          echo "复制后的文件:"
+          Get-ChildItem -Path target\release\bundle\msi -ErrorAction SilentlyContinue
+          Get-ChildItem -Path target\release\bundle\nsis -ErrorAction SilentlyContinue
+          Get-ChildItem -Path target\release\bundle\app -ErrorAction SilentlyContinue
+          
+      - name: Upload non-Android artifacts
+        if: matrix.target != 'android'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}-${{ matrix.arch || 'app' }}
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/dmg/*.dmg
+            target/release/bundle/macos/*.app
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/msi/*.msi
+            target/release/bundle/app/*.exe
+            src-tauri/target/${{ matrix.arch }}-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.arch }}-apple-darwin/release/bundle/macos/*.app
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*setup.exe
+            src-tauri/target/release/*.exe
+          if-no-files-found: warn
+          
+      - name: Create Desktop Release
+        if: matrix.target != 'android'
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+            target/release/bundle/dmg/*.dmg
+            target/release/bundle/macos/*.app
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/msi/*.msi
+            target/release/bundle/app/*.exe
+            src-tauri/target/${{ matrix.arch }}-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/${{ matrix.arch }}-apple-darwin/release/bundle/macos/*.app
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*setup.exe
+            src-tauri/target/release/*.exe
+          draft: true
+          prerelease: false
+          fail_on_unmatched_files: false
+          
+      - name: Upload Android artifacts
+        if: matrix.target == 'android'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-app-${{ matrix.arch_name }}
+          path: target/release/bundle/android/*.apk
+          
+      - name: Create Android Release
+        if: matrix.target == 'android'
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: target/release/bundle/android/*.apk
+          draft: true
+          prerelease: false
